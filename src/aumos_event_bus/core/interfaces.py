@@ -161,3 +161,184 @@ class ISchemaRegistryClient(Protocol):
     async def delete_subject(self, subject: str, permanent: bool = False) -> list[int]:
         """Delete all versions of a subject."""
         ...
+
+
+@runtime_checkable
+class IDLQHandler(Protocol):
+    """Contract for dead letter queue lifecycle management."""
+
+    async def capture_failure(
+        self,
+        tenant_id: str,
+        source_topic: str,
+        message_key: str | None,
+        message_value: str,
+        failure_reason: str,
+        message_headers: dict[str, str] | None,
+        original_offset: int | None,
+        original_partition: int | None,
+        consumer_group: str | None,
+        correlation_id: str | None,
+        failure_details: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Capture a failed message into the DLQ."""
+        ...
+
+    async def schedule_retry(
+        self,
+        entry_id: uuid.UUID,
+        tenant_id: str,
+    ) -> dict[str, Any]:
+        """Schedule the next retry for a DLQ entry with exponential backoff."""
+        ...
+
+    async def get_dlq_depth(
+        self,
+        tenant_id: str,
+        source_topic: str | None,
+    ) -> dict[str, Any]:
+        """Return the current depth of the DLQ for monitoring."""
+        ...
+
+    async def replay_entry(
+        self,
+        entry_id: uuid.UUID,
+        tenant_id: str,
+        target_topic: str | None,
+    ) -> dict[str, Any]:
+        """Manually replay a DLQ entry to its source or a target topic."""
+        ...
+
+    async def filter_entries(
+        self,
+        tenant_id: str,
+        source_topic: str | None,
+        status: str | None,
+        consumer_group: str | None,
+        skip: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Inspect and filter DLQ entries for operator tooling."""
+        ...
+
+
+@runtime_checkable
+class IEventVersionManager(Protocol):
+    """Contract for event schema version management."""
+
+    async def register_version(
+        self,
+        subject: str,
+        schema_definition: str,
+        tenant_id: str,
+        topic_id: uuid.UUID | None,
+        compatibility: Any | None,
+        schema_type: str,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Register a new schema version with compatibility validation."""
+        ...
+
+    async def check_compatibility(
+        self,
+        subject: str,
+        schema_definition: str,
+        mode: Any | None,
+    ) -> dict[str, Any]:
+        """Check whether a schema definition is compatible with existing versions."""
+        ...
+
+    async def get_version_history(
+        self,
+        subject: str,
+        tenant_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return the full version history for a schema subject."""
+        ...
+
+    async def negotiate_version(
+        self,
+        subject: str,
+        tenant_id: str,
+        producer_version: int,
+        consumer_min_version: int,
+    ) -> dict[str, Any]:
+        """Negotiate a compatible schema version between producer and consumer."""
+        ...
+
+    async def detect_deprecated_versions(
+        self,
+        tenant_id: str,
+    ) -> list[dict[str, Any]]:
+        """Detect and report deprecated schema versions across all subjects."""
+        ...
+
+
+@runtime_checkable
+class IEventBusMonitoringDashboard(Protocol):
+    """Contract for event bus monitoring and metrics aggregation."""
+
+    async def get_full_snapshot(self, tenant_id: str) -> dict[str, Any]:
+        """Return a complete monitoring snapshot for dashboard rendering."""
+        ...
+
+    async def get_topic_throughput(
+        self,
+        topic_name: str,
+        window_seconds: int,
+    ) -> dict[str, Any]:
+        """Return throughput metrics for a specific topic."""
+        ...
+
+    async def get_consumer_lag_for_group(
+        self,
+        group_id: str,
+        topic_name: str | None,
+    ) -> dict[str, Any]:
+        """Return consumer lag metrics for a specific consumer group."""
+        ...
+
+    async def export_dashboard_json(self, tenant_id: str) -> dict[str, Any]:
+        """Export a complete dashboard payload for rendering."""
+        ...
+
+
+@runtime_checkable
+class IConsumerGroupManager(Protocol):
+    """Contract for Kafka consumer group lifecycle management."""
+
+    async def create_group_config(
+        self,
+        group_id: str,
+        tenant_id: str,
+        description: str,
+        topics: list[str] | None,
+        auto_offset_reset: str,
+        session_timeout_ms: int,
+        heartbeat_interval_ms: int,
+        max_poll_interval_ms: int,
+    ) -> dict[str, Any]:
+        """Register a consumer group configuration."""
+        ...
+
+    async def reset_offsets(
+        self,
+        group_id: str,
+        topic: str,
+        position: str,
+        specific_offsets: dict[int, int] | None,
+    ) -> dict[str, Any]:
+        """Reset consumer group offsets for a topic."""
+        ...
+
+    async def get_group_lag(self, group_id: str) -> dict[str, Any]:
+        """Return consumer lag metrics for a group."""
+        ...
+
+    async def get_performance_analytics(self, group_id: str) -> dict[str, Any]:
+        """Return performance analytics for a consumer group."""
+        ...
+
+    async def get_group_health_status(self, group_id: str) -> dict[str, Any]:
+        """Return aggregated health status for a consumer group."""
+        ...

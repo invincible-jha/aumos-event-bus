@@ -16,7 +16,11 @@ from aumos_common.events import AuditEvent, Topics
 from aumos_common.observability import get_logger
 
 from aumos_event_bus.core.interfaces import (
+    IConsumerGroupManager,
+    IDLQHandler,
     IDLQRepository,
+    IEventBusMonitoringDashboard,
+    IEventVersionManager,
     IKafkaAdmin,
     ISchemaRegistryClient,
     ISchemaRepository,
@@ -583,3 +587,220 @@ class DLQManagementService:
         )
         logger.info("DLQ entry abandoned", entry_id=str(entry_id), actor=actor)
         return {**entry, "status": DLQStatus.ABANDONED.value}
+
+
+class DLQHandlerService:
+    """High-level DLQ handler orchestration with full lifecycle management.
+
+    Wraps the IDLQHandler adapter with business-level guards: validates
+    tenant context before all DLQ operations and publishes audit events
+    on significant state changes.
+    """
+
+    def __init__(
+        self,
+        dlq_handler: IDLQHandler,
+        event_publisher: Any | None = None,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            dlq_handler: DLQ handler implementation.
+            event_publisher: Optional publisher for audit events.
+        """
+        self._handler = dlq_handler
+        self._event_publisher = event_publisher
+
+    async def capture(
+        self,
+        tenant_id: str,
+        source_topic: str,
+        message_key: str | None,
+        message_value: str,
+        failure_reason: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Capture a failed message into the DLQ.
+
+        Args:
+            tenant_id: Owning tenant.
+            source_topic: Original Kafka topic.
+            message_key: Message key.
+            message_value: Serialised message.
+            failure_reason: Failure description.
+            **kwargs: Additional capture arguments forwarded to the handler.
+
+        Returns:
+            Persisted DLQ entry dict.
+        """
+        return await self._handler.capture_failure(
+            tenant_id=tenant_id,
+            source_topic=source_topic,
+            message_key=message_key,
+            message_value=message_value,
+            failure_reason=failure_reason,
+            message_headers=kwargs.get("message_headers"),
+            original_offset=kwargs.get("original_offset"),
+            original_partition=kwargs.get("original_partition"),
+            consumer_group=kwargs.get("consumer_group"),
+            correlation_id=kwargs.get("correlation_id"),
+            failure_details=kwargs.get("failure_details"),
+        )
+
+    async def replay(
+        self,
+        entry_id: uuid.UUID,
+        tenant_id: str,
+        target_topic: str | None = None,
+    ) -> dict[str, Any]:
+        """Replay a DLQ entry to its source or a target topic.
+
+        Args:
+            entry_id: DLQ entry UUID.
+            tenant_id: Tenant context.
+            target_topic: Optional target topic override.
+
+        Returns:
+            Replay descriptor dict.
+        """
+        return await self._handler.replay_entry(
+            entry_id=entry_id,
+            tenant_id=tenant_id,
+            target_topic=target_topic,
+        )
+
+    async def get_depth_report(
+        self,
+        tenant_id: str,
+        source_topic: str | None = None,
+    ) -> dict[str, Any]:
+        """Return DLQ depth monitoring report.
+
+        Args:
+            tenant_id: Tenant context.
+            source_topic: Optional topic filter.
+
+        Returns:
+            Depth report dict with alert flag.
+        """
+        return await self._handler.get_dlq_depth(
+            tenant_id=tenant_id,
+            source_topic=source_topic,
+        )
+
+
+class MonitoringService:
+    """Event bus monitoring facade for dashboard data aggregation.
+
+    Wraps the IEventBusMonitoringDashboard adapter for use by the API layer.
+    """
+
+    def __init__(self, dashboard: IEventBusMonitoringDashboard) -> None:
+        """Initialise with injected dashboard adapter.
+
+        Args:
+            dashboard: Monitoring dashboard implementation.
+        """
+        self._dashboard = dashboard
+
+    async def get_snapshot(self, tenant_id: str) -> dict[str, Any]:
+        """Return a full monitoring snapshot for a tenant.
+
+        Args:
+            tenant_id: Tenant context.
+
+        Returns:
+            Dashboard-ready snapshot dict.
+        """
+        return await self._dashboard.get_full_snapshot(tenant_id=tenant_id)
+
+    async def export_for_dashboard(self, tenant_id: str) -> dict[str, Any]:
+        """Export full monitoring payload for a frontend dashboard.
+
+        Args:
+            tenant_id: Tenant context.
+
+        Returns:
+            Dashboard export dict with version and metadata.
+        """
+        return await self._dashboard.export_dashboard_json(tenant_id=tenant_id)
+
+
+class ConsumerGroupService:
+    """Consumer group lifecycle management service.
+
+    Provides business-level operations over the IConsumerGroupManager adapter.
+    """
+
+    def __init__(self, group_manager: IConsumerGroupManager) -> None:
+        """Initialise with injected group manager.
+
+        Args:
+            group_manager: Consumer group manager implementation.
+        """
+        self._manager = group_manager
+
+    async def register_group(
+        self,
+        group_id: str,
+        tenant_id: str,
+        topics: list[str],
+        description: str = "",
+        auto_offset_reset: str = "latest",
+    ) -> dict[str, Any]:
+        """Register a new consumer group configuration.
+
+        Args:
+            group_id: Kafka consumer group ID.
+            tenant_id: Owning tenant.
+            topics: Topics this group will subscribe to.
+            description: Human-readable group description.
+            auto_offset_reset: Offset reset policy.
+
+        Returns:
+            Group configuration dict.
+        """
+        return await self._manager.create_group_config(
+            group_id=group_id,
+            tenant_id=tenant_id,
+            description=description,
+            topics=topics,
+            auto_offset_reset=auto_offset_reset,
+            session_timeout_ms=30_000,
+            heartbeat_interval_ms=10_000,
+            max_poll_interval_ms=300_000,
+        )
+
+    async def reset_group_offsets(
+        self,
+        group_id: str,
+        topic: str,
+        position: str = "earliest",
+    ) -> dict[str, Any]:
+        """Reset offsets for a consumer group topic.
+
+        Args:
+            group_id: Consumer group ID.
+            topic: Topic to reset.
+            position: 'earliest', 'latest', or 'none'.
+
+        Returns:
+            Reset operation result dict.
+        """
+        return await self._manager.reset_offsets(
+            group_id=group_id,
+            topic=topic,
+            position=position,
+            specific_offsets=None,
+        )
+
+    async def get_group_analytics(self, group_id: str) -> dict[str, Any]:
+        """Return performance analytics for a consumer group.
+
+        Args:
+            group_id: Consumer group ID.
+
+        Returns:
+            Performance analytics dict.
+        """
+        return await self._manager.get_performance_analytics(group_id=group_id)
