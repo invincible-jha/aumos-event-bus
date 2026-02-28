@@ -20,25 +20,52 @@ from aumos_event_bus.adapters.kafka_admin import KafkaAdminAdapter
 from aumos_event_bus.adapters.repositories import DLQRepository, SchemaRepository, TopicRepository
 from aumos_event_bus.adapters.schema_registry import SchemaRegistryAdapter
 from aumos_event_bus.api.schemas import (
+    ConnectorCreateRequest,
+    ConnectorListResponse,
+    ConnectorResponse,
+    ConsumerGroupLagResponse,
+    ConsumerGroupListResponse,
     DLQEntryResponse,
     DLQListResponse,
     DLQResolveResponse,
     DLQRetryResponse,
+    GeoReplicationFlowCreateRequest,
+    GeoReplicationFlowResponse,
+    ReplayJobCreateRequest,
+    ReplayJobResponse,
     SchemaCompatibilityRequest,
     SchemaCompatibilityResponse,
+    SchemaEvolutionPreviewRequest,
+    SchemaEvolutionPreviewResponse,
     SchemaRegisterRequest,
     SchemaResponse,
     SchemaVersionsResponse,
+    StreamJobCreateRequest,
+    StreamJobListResponse,
+    StreamJobResponse,
     TenantPartitionResponse,
+    TieredStorageConfigRequest,
+    TieredStorageConfigResponse,
     TopicCreateRequest,
     TopicListResponse,
     TopicMetricsResponse,
     TopicResponse,
 )
+from aumos_event_bus.adapters.kafka_connect_client import KafkaConnectClient
+from aumos_event_bus.adapters.ksqldb_client import KsqldbClient
+from aumos_event_bus.adapters.flink_client import FlinkClient
+from aumos_event_bus.adapters.strimzi_client import StrimziMirrorMaker2Client
 from aumos_event_bus.core.services import (
+    ConnectorService,
+    ConsumerGroupMonitoringService,
     DLQManagementService,
+    EventReplayService,
+    GeoReplicationService,
+    SchemaEvolutionService,
     SchemaRegisterRequest as CoreSchemaRequest,
     SchemaValidationService,
+    StreamProcessingService,
+    TieredStorageService,
     TopicCreateRequest as CoreTopicRequest,
     TopicManagementService,
 )
@@ -483,6 +510,475 @@ async def abandon_dlq_entry(
     """
     result = await service.mark_abandoned(entry_id=entry_id, tenant_id=tenant_id, actor=actor)
     return DLQResolveResponse(entry_id=entry_id, status=result["status"], message="Entry abandoned")
+
+
+# ---------------------------------------------------------------------------
+# Stream processing endpoints (Gap #23)
+# ---------------------------------------------------------------------------
+
+
+def get_stream_service() -> StreamProcessingService:
+    """Construct StreamProcessingService with configured backend clients.
+
+    Returns:
+        Configured StreamProcessingService instance.
+    """
+    ksqldb_client = KsqldbClient(
+        base_url=settings.ksqldb_url,
+        username=settings.ksqldb_username,
+        password=settings.ksqldb_password,
+    ) if settings.stream_backend == "ksqldb" else None
+    flink_client = FlinkClient(base_url=settings.flink_rest_url) if settings.stream_backend == "flink" else None
+    return StreamProcessingService(
+        ksqldb_client=ksqldb_client,
+        flink_client=flink_client,
+        backend=settings.stream_backend,
+    )
+
+
+@router.post("/streams", response_model=StreamJobResponse, status_code=201)
+async def create_stream_job(
+    body: StreamJobCreateRequest,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[StreamProcessingService, Depends(get_stream_service)],
+) -> StreamJobResponse:
+    """Create a stream processing job on the configured backend (ksqlDB or Flink).
+
+    Args:
+        body: Stream job configuration.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected stream processing service.
+
+    Returns:
+        Created stream job descriptor.
+    """
+    result = await service.create_stream_job(
+        tenant_id=tenant_id,
+        name=body.name,
+        query_text=body.query_text,
+        input_topics=body.input_topics,
+        output_topic=body.output_topic,
+        backend_override=body.backend,
+    )
+    return StreamJobResponse(**result)
+
+
+@router.get("/streams", response_model=StreamJobListResponse)
+async def list_stream_jobs(
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[StreamProcessingService, Depends(get_stream_service)],
+) -> StreamJobListResponse:
+    """List active stream processing jobs.
+
+    Args:
+        tenant_id: Tenant extracted from auth context.
+        service: Injected stream processing service.
+
+    Returns:
+        List of active stream jobs.
+    """
+    jobs = await service.list_stream_jobs()
+    return StreamJobListResponse(jobs=jobs, total=len(jobs))
+
+
+@router.delete("/streams/{backend_job_id}", status_code=200)
+async def terminate_stream_job(
+    backend_job_id: str,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[StreamProcessingService, Depends(get_stream_service)],
+) -> dict:
+    """Terminate a running stream processing job.
+
+    Args:
+        backend_job_id: Backend-specific job ID.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected stream processing service.
+
+    Returns:
+        Termination result.
+    """
+    result = await service.terminate_stream_job(backend_job_id=backend_job_id)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Kafka Connect connector endpoints (Gap #24)
+# ---------------------------------------------------------------------------
+
+
+def get_connector_service() -> ConnectorService:
+    """Construct ConnectorService with Kafka Connect client.
+
+    Returns:
+        Configured ConnectorService instance.
+    """
+    client = KafkaConnectClient(base_url=settings.kafka_connect_url)
+    return ConnectorService(connect_client=client)
+
+
+@router.post("/connectors", response_model=ConnectorResponse, status_code=201)
+async def create_connector(
+    body: ConnectorCreateRequest,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+) -> ConnectorResponse:
+    """Create a Kafka Connect connector scoped to the current tenant.
+
+    Args:
+        body: Connector name and configuration.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected connector service.
+
+    Returns:
+        Created connector descriptor.
+    """
+    result = await service.create_connector(
+        tenant_id=tenant_id,
+        name=body.name,
+        config=body.config,
+    )
+    return ConnectorResponse(name=result.get("name", body.name), config=result.get("config", body.config))
+
+
+@router.get("/connectors", response_model=ConnectorListResponse)
+async def list_connectors(
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+) -> ConnectorListResponse:
+    """List all Kafka Connect connectors owned by the current tenant.
+
+    Args:
+        tenant_id: Tenant extracted from auth context.
+        service: Injected connector service.
+
+    Returns:
+        Paginated list of connectors.
+    """
+    items = await service.list_connectors(tenant_id=tenant_id)
+    return ConnectorListResponse(items=items, total=len(items))
+
+
+@router.get("/connectors/{name}/status", response_model=ConnectorResponse)
+async def get_connector_status(
+    name: str,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+) -> ConnectorResponse:
+    """Get runtime status for a tenant-owned connector.
+
+    Args:
+        name: Base connector name.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected connector service.
+
+    Returns:
+        Connector status.
+    """
+    status = await service.get_connector_status(tenant_id=tenant_id, name=name)
+    return ConnectorResponse(name=name, status=status)
+
+
+@router.delete("/connectors/{name}", status_code=204)
+async def delete_connector(
+    name: str,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+) -> None:
+    """Delete a tenant-owned Kafka Connect connector.
+
+    Args:
+        name: Base connector name.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected connector service.
+    """
+    await service.delete_connector(tenant_id=tenant_id, name=name)
+
+
+@router.post("/connectors/{name}/restart")
+async def restart_connector(
+    name: str,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[ConnectorService, Depends(get_connector_service)],
+) -> dict:
+    """Restart a tenant-owned Kafka Connect connector.
+
+    Args:
+        name: Base connector name.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected connector service.
+
+    Returns:
+        Restart result.
+    """
+    result = await service.restart_connector(tenant_id=tenant_id, name=name)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Consumer group monitoring endpoints (Gap #25)
+# ---------------------------------------------------------------------------
+
+
+def get_consumer_monitoring_service() -> ConsumerGroupMonitoringService:
+    """Construct ConsumerGroupMonitoringService.
+
+    Returns:
+        Configured ConsumerGroupMonitoringService instance.
+    """
+    kafka_admin = KafkaAdminAdapter(settings=settings)
+    return ConsumerGroupMonitoringService(kafka_admin=kafka_admin)
+
+
+@router.get("/consumer-groups", response_model=ConsumerGroupListResponse)
+async def list_consumer_groups(
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[ConsumerGroupMonitoringService, Depends(get_consumer_monitoring_service)],
+) -> ConsumerGroupListResponse:
+    """List consumer groups filtered to the current tenant.
+
+    Args:
+        tenant_id: Tenant extracted from auth context.
+        service: Injected consumer group monitoring service.
+
+    Returns:
+        List of consumer group summaries.
+    """
+    from aumos_event_bus.api.schemas import ConsumerGroupSummary
+    groups = await service.list_consumer_groups(tenant_id=tenant_id)
+    summaries = [ConsumerGroupSummary(**g) for g in groups]
+    return ConsumerGroupListResponse(groups=summaries, total=len(summaries))
+
+
+@router.get("/consumer-groups/{group_id}/lag", response_model=ConsumerGroupLagResponse)
+async def get_consumer_group_lag(
+    group_id: str,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[ConsumerGroupMonitoringService, Depends(get_consumer_monitoring_service)],
+) -> ConsumerGroupLagResponse:
+    """Get per-partition lag for a consumer group.
+
+    Args:
+        group_id: Consumer group ID.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected consumer group monitoring service.
+
+    Returns:
+        Consumer group lag information.
+    """
+    result = await service.get_consumer_group_lag(group_id=group_id, tenant_id=tenant_id)
+    return ConsumerGroupLagResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Event replay endpoints (Gap #26)
+# ---------------------------------------------------------------------------
+
+
+def get_replay_service() -> EventReplayService:
+    """Construct EventReplayService.
+
+    Returns:
+        Configured EventReplayService instance.
+    """
+    kafka_admin = KafkaAdminAdapter(settings=settings)
+    return EventReplayService(kafka_admin=kafka_admin)
+
+
+@router.post("/consumer-groups/{group_id}/replay", response_model=ReplayJobResponse, status_code=201)
+async def create_replay_job(
+    group_id: str,
+    body: ReplayJobCreateRequest,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[EventReplayService, Depends(get_replay_service)],
+) -> ReplayJobResponse:
+    """Create an event replay job for a consumer group.
+
+    Args:
+        group_id: Consumer group ID to replay.
+        body: Replay configuration.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected event replay service.
+
+    Returns:
+        Replay job descriptor.
+    """
+    result = await service.create_replay_job(
+        tenant_id=tenant_id,
+        group_id=group_id,
+        topic=body.topic,
+        from_offset_type=body.from_offset_type,
+        from_timestamp=body.from_timestamp,
+    )
+    return ReplayJobResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Geo-replication endpoints (Gap #27)
+# ---------------------------------------------------------------------------
+
+
+def get_geo_replication_service() -> GeoReplicationService:
+    """Construct GeoReplicationService with Strimzi client.
+
+    Returns:
+        Configured GeoReplicationService instance.
+    """
+    strimzi_client = StrimziMirrorMaker2Client(namespace=settings.strimzi_namespace)
+    return GeoReplicationService(strimzi_client=strimzi_client)
+
+
+@router.post("/geo-replication", response_model=GeoReplicationFlowResponse, status_code=201)
+async def create_geo_replication_flow(
+    body: GeoReplicationFlowCreateRequest,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[GeoReplicationService, Depends(get_geo_replication_service)],
+) -> GeoReplicationFlowResponse:
+    """Create a MirrorMaker2 geo-replication flow.
+
+    Args:
+        body: Replication flow configuration.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected geo-replication service.
+
+    Returns:
+        Created replication flow descriptor.
+    """
+    result = await service.create_flow(
+        tenant_id=tenant_id,
+        name=body.name,
+        source_bootstrap=body.source_bootstrap,
+        target_bootstrap=body.target_bootstrap,
+        topics_pattern=body.topics_pattern,
+    )
+    return GeoReplicationFlowResponse(**result)
+
+
+@router.get("/geo-replication", response_model=list[GeoReplicationFlowResponse])
+async def list_geo_replication_flows(
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[GeoReplicationService, Depends(get_geo_replication_service)],
+) -> list[GeoReplicationFlowResponse]:
+    """List geo-replication flows for the current tenant.
+
+    Args:
+        tenant_id: Tenant extracted from auth context.
+        service: Injected geo-replication service.
+
+    Returns:
+        List of replication flow descriptors.
+    """
+    flows = await service.list_flows(tenant_id=tenant_id)
+    return [
+        GeoReplicationFlowResponse(
+            name=f.get("metadata", {}).get("name", ""),
+            tenant_id=tenant_id,
+            source_bootstrap="",
+            target_bootstrap="",
+            topics_pattern=".*",
+            status=f.get("status", {}).get("conditions", [{}])[-1].get("type", "unknown"),
+        )
+        for f in flows
+    ]
+
+
+@router.delete("/geo-replication/{name}", status_code=204)
+async def delete_geo_replication_flow(
+    name: str,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[GeoReplicationService, Depends(get_geo_replication_service)],
+) -> None:
+    """Delete a geo-replication flow.
+
+    Args:
+        name: Replication flow name.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected geo-replication service.
+    """
+    await service.delete_flow(tenant_id=tenant_id, name=name)
+
+
+# ---------------------------------------------------------------------------
+# Tiered storage endpoints (Gap #28)
+# ---------------------------------------------------------------------------
+
+
+def get_tiered_storage_service() -> TieredStorageService:
+    """Construct TieredStorageService.
+
+    Returns:
+        Configured TieredStorageService instance.
+    """
+    kafka_admin = KafkaAdminAdapter(settings=settings)
+    return TieredStorageService(kafka_admin=kafka_admin)
+
+
+@router.put("/topics/{topic_name}/tiered-storage", response_model=TieredStorageConfigResponse)
+async def configure_tiered_storage(
+    topic_name: str,
+    body: TieredStorageConfigRequest,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[TieredStorageService, Depends(get_tiered_storage_service)],
+) -> TieredStorageConfigResponse:
+    """Configure tiered (S3) storage for a Kafka topic.
+
+    Args:
+        topic_name: Kafka topic name.
+        body: Tiered storage configuration.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected tiered storage service.
+
+    Returns:
+        Updated tiered storage configuration.
+    """
+    s3_bucket = body.s3_bucket or settings.tiered_storage_s3_bucket
+    result = await service.configure_tiered_storage(
+        topic_name=topic_name,
+        tenant_id=tenant_id,
+        tier_local_hot_ms=body.tier_local_hot_ms,
+        s3_bucket=s3_bucket,
+        enabled=body.enabled,
+    )
+    return TieredStorageConfigResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Schema evolution endpoints (Gap #30)
+# ---------------------------------------------------------------------------
+
+
+def get_schema_evolution_service() -> SchemaEvolutionService:
+    """Construct SchemaEvolutionService.
+
+    Returns:
+        Configured SchemaEvolutionService instance.
+    """
+    from aumos_event_bus.adapters.schema_registry import SchemaRegistryAdapter
+    registry_client = SchemaRegistryAdapter(settings=settings)
+    return SchemaEvolutionService(registry_client=registry_client)
+
+
+@router.post("/schemas/preview-evolution", response_model=SchemaEvolutionPreviewResponse)
+async def preview_schema_evolution(
+    body: SchemaEvolutionPreviewRequest,
+    tenant_id: Annotated[str, Depends(get_current_tenant)],
+    service: Annotated[SchemaEvolutionService, Depends(get_schema_evolution_service)],
+) -> SchemaEvolutionPreviewResponse:
+    """Preview schema evolution compatibility and field diff.
+
+    Args:
+        body: Schema evolution preview request.
+        tenant_id: Tenant extracted from auth context.
+        service: Injected schema evolution service.
+
+    Returns:
+        Compatibility result, field diff, and recommendation.
+    """
+    result = await service.preview_evolution(
+        subject=body.subject,
+        new_schema_definition=body.new_schema_definition,
+        tenant_id=tenant_id,
+    )
+    return SchemaEvolutionPreviewResponse(**result)
 
 
 # ---------------------------------------------------------------------------

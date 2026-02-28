@@ -342,3 +342,70 @@ class IConsumerGroupManager(Protocol):
     async def get_group_health_status(self, group_id: str) -> dict[str, Any]:
         """Return aggregated health status for a consumer group."""
         ...
+
+
+@runtime_checkable
+class IStreamBackend(Protocol):
+    """Contract for stream processing backend implementations (ksqlDB or Flink)."""
+
+    async def create_job(
+        self,
+        name: str,
+        query_or_config: str,
+        input_topics: list[str],
+        output_topic: str,
+        properties: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Submit a new stream processing job.
+
+        Args:
+            name: Human-readable job name.
+            query_or_config: SQL query (ksqldb) or JAR s3 key reference (flink).
+            input_topics: Source Kafka topics.
+            output_topic: Target Kafka topic for results.
+            properties: Backend-specific configuration properties.
+
+        Returns:
+            Job descriptor dict with backend_job_id.
+        """
+        ...
+
+    async def list_jobs(self) -> list[dict[str, Any]]:
+        """List all active stream processing jobs on this backend.
+
+        Returns:
+            List of job descriptor dicts.
+        """
+        ...
+
+    async def terminate_job(self, backend_job_id: str) -> dict[str, Any]:
+        """Terminate a running stream processing job.
+
+        Args:
+            backend_job_id: Backend-specific job identifier.
+
+        Returns:
+            Termination result dict.
+        """
+        ...
+
+
+@runtime_checkable
+class IConnectorRepository(Protocol):
+    """Interface for Kafka Connect connector audit persistence."""
+
+    async def create(self, data: dict[str, Any]) -> Any:
+        """Persist a new connector audit record."""
+        ...
+
+    async def get_by_name(self, name: str, tenant_id: str) -> Any | None:
+        """Retrieve a connector record by name."""
+        ...
+
+    async def list_all(self, tenant_id: str, skip: int = 0, limit: int = 50) -> list[Any]:
+        """List all connector records for a tenant."""
+        ...
+
+    async def delete_by_name(self, name: str, tenant_id: str) -> bool:
+        """Delete a connector audit record."""
+        ...

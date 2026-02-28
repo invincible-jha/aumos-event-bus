@@ -1,0 +1,39 @@
+site_name: AumOS Event Bus
+site_url: https://docs.aumos.ai/event-bus/
+repo_url: https://github.com/aumos/aumos-event-bus
+docs_dir: docs
+theme:
+  name: material
+  palette:
+    primary: deep purple
+    accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - toc.integrate
+    - content.code.copy
+plugins:
+  - search
+  - mermaid2
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+  - admonition
+  - toc:
+      permalink: true
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Quickstart: quickstart.md
+  - Guides:
+    - Topic Management: guides/topic-management.md
+    - Schema Registry: guides/schema-registry.md
+    - Stream Processing: guides/stream-processing.md
+    - Consumer Groups: guides/consumer-groups.md
+    - Dead Letter Queue: guides/dlq.md
+    - Geo-Replication: guides/geo-replication.md
+  - API Reference: api-reference.md
+  - Troubleshooting: troubleshooting.md

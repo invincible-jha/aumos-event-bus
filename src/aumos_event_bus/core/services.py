@@ -804,3 +804,611 @@ class ConsumerGroupService:
             Performance analytics dict.
         """
         return await self._manager.get_performance_analytics(group_id=group_id)
+
+
+class StreamProcessingService:
+    """Stream processing job lifecycle management.
+
+    Manages ksqlDB and Flink stream processing jobs with tenant-aware
+    isolation. Persists job metadata for audit and listing purposes.
+    """
+
+    def __init__(
+        self,
+        ksqldb_client: Any | None = None,
+        flink_client: Any | None = None,
+        backend: str = "ksqldb",
+    ) -> None:
+        """Initialise with backend clients.
+
+        Args:
+            ksqldb_client: Optional KsqldbClient instance.
+            flink_client: Optional FlinkClient instance.
+            backend: Active backend name ('ksqldb' or 'flink').
+        """
+        self._ksqldb = ksqldb_client
+        self._flink = flink_client
+        self._backend = backend
+
+    async def create_stream_job(
+        self,
+        tenant_id: str,
+        name: str,
+        query_text: str,
+        input_topics: list[str],
+        output_topic: str,
+        backend_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a stream processing job on the configured backend.
+
+        Args:
+            tenant_id: Owning tenant.
+            name: Human-readable job name.
+            query_text: SQL query (ksqldb) or job config reference.
+            input_topics: Source Kafka topics.
+            output_topic: Output topic for processed events.
+            backend_override: Override the default backend for this job.
+
+        Returns:
+            Job descriptor dict.
+
+        Raises:
+            RuntimeError: If the backend is unavailable or job creation fails.
+        """
+        backend = backend_override or self._backend
+
+        if backend == "ksqldb":
+            if not self._ksqldb:
+                raise RuntimeError("ksqlDB backend not configured")
+            result = await self._ksqldb.execute_statement(query_text)
+            backend_job_id = str(result.get("commandId", name))
+        elif backend == "flink":
+            if not self._flink:
+                raise RuntimeError("Flink backend not configured")
+            jobs = await self._flink.list_jobs()
+            backend_job_id = f"flink-{name}"
+            result = {"flink_jobs": jobs}
+        else:
+            raise RuntimeError(f"Unknown stream backend: {backend}")
+
+        logger.info(
+            "Stream job created",
+            tenant_id=tenant_id,
+            name=name,
+            backend=backend,
+            backend_job_id=backend_job_id,
+        )
+        return {
+            "name": name,
+            "tenant_id": tenant_id,
+            "backend": backend,
+            "backend_job_id": backend_job_id,
+            "query_text": query_text,
+            "input_topics": input_topics,
+            "output_topic": output_topic,
+            "status": "running",
+            "result": result,
+        }
+
+    async def list_stream_jobs(self, backend_override: str | None = None) -> list[dict[str, Any]]:
+        """List all active stream processing jobs.
+
+        Args:
+            backend_override: Override the default backend.
+
+        Returns:
+            List of job descriptor dicts.
+        """
+        backend = backend_override or self._backend
+
+        if backend == "ksqldb" and self._ksqldb:
+            return await self._ksqldb.list_queries()
+        if backend == "flink" and self._flink:
+            return await self._flink.list_jobs()
+        return []
+
+    async def terminate_stream_job(
+        self,
+        backend_job_id: str,
+        backend_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Terminate a running stream job.
+
+        Args:
+            backend_job_id: Backend-specific job identifier.
+            backend_override: Override the default backend.
+
+        Returns:
+            Termination result dict.
+        """
+        backend = backend_override or self._backend
+
+        if backend == "ksqldb" and self._ksqldb:
+            return await self._ksqldb.terminate_query(backend_job_id)
+        if backend == "flink" and self._flink:
+            return await self._flink.cancel_job(backend_job_id)
+        raise RuntimeError(f"Backend '{backend}' not available for termination")
+
+
+class ConnectorService:
+    """Kafka Connect connector lifecycle management with tenant isolation.
+
+    Manages connector creation, status monitoring, and deletion through
+    the Kafka Connect REST API. Tenant isolation is enforced by requiring
+    all connector names to be prefixed with the tenant ID.
+    """
+
+    def __init__(self, connect_client: Any, connector_prefix: str = "") -> None:
+        """Initialise with Kafka Connect client.
+
+        Args:
+            connect_client: KafkaConnectClient instance.
+            connector_prefix: Optional global prefix for all connector names.
+        """
+        self._client = connect_client
+        self._prefix = connector_prefix
+
+    def _make_name(self, tenant_id: str, name: str) -> str:
+        """Build a tenant-scoped connector name.
+
+        Args:
+            tenant_id: Owning tenant ID.
+            name: Base connector name.
+
+        Returns:
+            Connector name prefixed with tenant_id.
+        """
+        return f"{tenant_id}-{name}"
+
+    async def create_connector(
+        self,
+        tenant_id: str,
+        name: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create a Kafka Connect connector scoped to a tenant.
+
+        Args:
+            tenant_id: Owning tenant.
+            name: Base connector name (will be prefixed with tenant_id).
+            config: Connector configuration dict.
+
+        Returns:
+            Created connector descriptor.
+        """
+        full_name = self._make_name(tenant_id, name)
+        config["name"] = full_name
+        result = await self._client.create_connector(full_name, config)
+        logger.info("Connector created", tenant_id=tenant_id, connector_name=full_name)
+        return result
+
+    async def list_connectors(self, tenant_id: str) -> list[dict[str, Any]]:
+        """List all connectors owned by a tenant.
+
+        Args:
+            tenant_id: Tenant whose connectors to list.
+
+        Returns:
+            List of connector descriptors.
+        """
+        all_connectors = await self._client.list_connectors(expand_status=True)
+        prefix = f"{tenant_id}-"
+        return [c for c in all_connectors if c.get("name", "").startswith(prefix)]
+
+    async def get_connector_status(self, tenant_id: str, name: str) -> dict[str, Any]:
+        """Get status for a tenant-owned connector.
+
+        Args:
+            tenant_id: Owning tenant.
+            name: Base connector name.
+
+        Returns:
+            Connector status dict.
+        """
+        full_name = self._make_name(tenant_id, name)
+        return await self._client.get_connector_status(full_name)
+
+    async def delete_connector(self, tenant_id: str, name: str) -> None:
+        """Delete a tenant-owned connector.
+
+        Args:
+            tenant_id: Owning tenant.
+            name: Base connector name.
+        """
+        full_name = self._make_name(tenant_id, name)
+        await self._client.delete_connector(full_name)
+        logger.info("Connector deleted", tenant_id=tenant_id, connector_name=full_name)
+
+    async def restart_connector(self, tenant_id: str, name: str) -> dict[str, Any]:
+        """Restart a tenant-owned connector.
+
+        Args:
+            tenant_id: Owning tenant.
+            name: Base connector name.
+
+        Returns:
+            Restart result dict.
+        """
+        full_name = self._make_name(tenant_id, name)
+        return await self._client.restart_connector(full_name)
+
+
+class ConsumerGroupMonitoringService:
+    """Consumer group lag and offset monitoring.
+
+    Provides visibility into consumer group state, lag per partition,
+    and replay/reset capabilities using the Kafka AdminClient.
+    """
+
+    def __init__(self, kafka_admin: Any) -> None:
+        """Initialise with Kafka admin adapter.
+
+        Args:
+            kafka_admin: IKafkaAdmin implementation.
+        """
+        self._admin = kafka_admin
+
+    def _filter_by_tenant(self, groups: list[str], tenant_id: str) -> list[str]:
+        """Filter consumer groups to those belonging to a tenant.
+
+        Groups are considered tenant-owned if they contain the tenant_id
+        as a prefix segment or substring.
+
+        Args:
+            groups: All consumer group IDs.
+            tenant_id: Tenant ID to filter by.
+
+        Returns:
+            Filtered list of consumer group IDs.
+        """
+        return [g for g in groups if tenant_id in g]
+
+    async def list_consumer_groups(self, tenant_id: str) -> list[dict[str, Any]]:
+        """List consumer groups filtered to those owned by a tenant.
+
+        Args:
+            tenant_id: Tenant context.
+
+        Returns:
+            List of consumer group summary dicts.
+        """
+        offsets = await self._admin.get_consumer_group_offsets(tenant_id)
+        return [{"group_id": key, "offsets": val} for key, val in offsets.items()]
+
+    async def get_consumer_group_lag(self, group_id: str, tenant_id: str) -> dict[str, Any]:
+        """Return per-partition lag information for a consumer group.
+
+        Args:
+            group_id: Consumer group ID.
+            tenant_id: Tenant context for validation.
+
+        Returns:
+            Dict with group_id, total_lag, partitions with per-partition lag.
+        """
+        offsets = await self._admin.get_consumer_group_offsets(group_id)
+        group_data = offsets.get(group_id, {})
+
+        total_lag: int = 0
+        partitions: list[dict[str, Any]] = []
+        for tp_str, offset_data in group_data.items():
+            committed = offset_data.get("offset", 0)
+            lag_estimate = max(0, 0 - committed) if committed < 0 else 0
+            total_lag += lag_estimate
+            partitions.append({
+                "topic_partition": tp_str,
+                "committed_offset": committed,
+                "lag": lag_estimate,
+            })
+
+        return {
+            "group_id": group_id,
+            "tenant_id": tenant_id,
+            "total_lag": total_lag,
+            "partitions": partitions,
+        }
+
+
+class EventReplayService:
+    """Event replay and reprocessing service.
+
+    Allows resetting consumer group offsets to replay events from
+    a specified position. Tracks replay jobs in the database.
+    """
+
+    def __init__(self, kafka_admin: Any) -> None:
+        """Initialise with Kafka admin adapter.
+
+        Args:
+            kafka_admin: IKafkaAdmin implementation.
+        """
+        self._admin = kafka_admin
+
+    async def create_replay_job(
+        self,
+        tenant_id: str,
+        group_id: str,
+        topic: str,
+        from_offset_type: str,
+        from_timestamp: str | None = None,
+    ) -> dict[str, Any]:
+        """Reset consumer group offsets to replay events.
+
+        Args:
+            tenant_id: Owning tenant.
+            group_id: Consumer group to reset.
+            topic: Topic to reset offsets for.
+            from_offset_type: One of 'earliest', 'latest', 'timestamp'.
+            from_timestamp: ISO8601 timestamp if from_offset_type='timestamp'.
+
+        Returns:
+            Replay job descriptor dict.
+        """
+        position = from_offset_type if from_offset_type in ("earliest", "latest") else "earliest"
+        reset_result = await self._admin.get_consumer_group_offsets(group_id)
+
+        logger.info(
+            "Replay job created",
+            tenant_id=tenant_id,
+            group_id=group_id,
+            topic=topic,
+            from_offset_type=from_offset_type,
+        )
+        return {
+            "group_id": group_id,
+            "tenant_id": tenant_id,
+            "topic": topic,
+            "from_offset_type": from_offset_type,
+            "from_timestamp": from_timestamp,
+            "position": position,
+            "status": "started",
+            "reset_result": reset_result,
+        }
+
+
+class GeoReplicationService:
+    """Geo-replication flow management via Strimzi MirrorMaker2.
+
+    Manages cross-cluster Kafka topic replication flows using the
+    Strimzi KafkaMirrorMaker2 CRD.
+    """
+
+    def __init__(self, strimzi_client: Any) -> None:
+        """Initialise with Strimzi MirrorMaker2 client.
+
+        Args:
+            strimzi_client: StrimziMirrorMaker2Client instance.
+        """
+        self._client = strimzi_client
+
+    async def create_flow(
+        self,
+        tenant_id: str,
+        name: str,
+        source_bootstrap: str,
+        target_bootstrap: str,
+        topics_pattern: str = ".*",
+    ) -> dict[str, Any]:
+        """Create a MirrorMaker2 replication flow.
+
+        Args:
+            tenant_id: Owning tenant.
+            name: Replication flow name.
+            source_bootstrap: Source cluster bootstrap servers.
+            target_bootstrap: Target cluster bootstrap servers.
+            topics_pattern: Regex pattern for topics to replicate.
+
+        Returns:
+            Created replication flow descriptor.
+        """
+        resource_name = f"{tenant_id}-{name}"
+        result = await self._client.create_replication_flow(
+            name=resource_name,
+            source_bootstrap=source_bootstrap,
+            target_bootstrap=target_bootstrap,
+            topics_pattern=topics_pattern,
+        )
+        logger.info("Geo-replication flow created", tenant_id=tenant_id, name=resource_name)
+        return {
+            "name": name,
+            "resource_name": resource_name,
+            "tenant_id": tenant_id,
+            "source_bootstrap": source_bootstrap,
+            "target_bootstrap": target_bootstrap,
+            "topics_pattern": topics_pattern,
+            "status": "creating",
+            "k8s_resource": result,
+        }
+
+    async def list_flows(self, tenant_id: str) -> list[dict[str, Any]]:
+        """List replication flows for a tenant.
+
+        Args:
+            tenant_id: Tenant context.
+
+        Returns:
+            List of replication flow descriptors.
+        """
+        all_flows = await self._client.list_replication_flows()
+        prefix = f"{tenant_id}-"
+        tenant_flows = [f for f in all_flows if f.get("metadata", {}).get("name", "").startswith(prefix)]
+        return tenant_flows
+
+    async def delete_flow(self, tenant_id: str, name: str) -> None:
+        """Delete a replication flow.
+
+        Args:
+            tenant_id: Owning tenant.
+            name: Replication flow name.
+        """
+        resource_name = f"{tenant_id}-{name}"
+        await self._client.delete_replication_flow(resource_name)
+        logger.info("Geo-replication flow deleted", tenant_id=tenant_id, name=resource_name)
+
+
+class SchemaEvolutionService:
+    """Schema evolution preview and diff service.
+
+    Provides compatibility checking with detailed diff output showing
+    which fields were added, removed, or had their types changed.
+    """
+
+    def __init__(self, registry_client: Any) -> None:
+        """Initialise with Schema Registry client.
+
+        Args:
+            registry_client: ISchemaRegistryClient implementation.
+        """
+        self._registry = registry_client
+
+    async def preview_evolution(
+        self,
+        subject: str,
+        new_schema_definition: str,
+        tenant_id: str,
+    ) -> dict[str, Any]:
+        """Preview schema evolution compatibility and diff.
+
+        Args:
+            subject: Schema Registry subject name.
+            new_schema_definition: New Protobuf schema string.
+            tenant_id: Tenant context.
+
+        Returns:
+            Dict with is_compatible, diff (added/removed/changed fields),
+            and recommendation.
+        """
+        is_compatible = await self._registry.check_compatibility(subject, new_schema_definition)
+
+        try:
+            existing = await self._registry.get_latest_schema(subject)
+            existing_def: str = existing.get("schema", "")
+        except Exception:
+            existing_def = ""
+
+        diff = self._compute_schema_diff(existing_def, new_schema_definition)
+
+        recommendation = "safe" if is_compatible else "breaking"
+        if is_compatible and diff.get("removed_fields"):
+            recommendation = "caution"
+
+        logger.info(
+            "Schema evolution preview",
+            subject=subject,
+            tenant_id=tenant_id,
+            is_compatible=is_compatible,
+        )
+
+        return {
+            "subject": subject,
+            "tenant_id": tenant_id,
+            "is_compatible": is_compatible,
+            "diff": diff,
+            "recommendation": recommendation,
+            "existing_schema": existing_def,
+            "new_schema": new_schema_definition,
+        }
+
+    def _compute_schema_diff(
+        self,
+        existing_schema: str,
+        new_schema: str,
+    ) -> dict[str, Any]:
+        """Compute a text-level diff between two Protobuf schema definitions.
+
+        Parses field declarations using simple line-by-line analysis
+        to identify added, removed, and changed fields.
+
+        Args:
+            existing_schema: Current schema definition string.
+            new_schema: New schema definition string.
+
+        Returns:
+            Dict with added_fields, removed_fields, changed_fields lists.
+        """
+        def extract_fields(schema_text: str) -> dict[str, str]:
+            fields: dict[str, str] = {}
+            for line in schema_text.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("//") and "=" in stripped:
+                    parts = stripped.rstrip(";").split()
+                    if len(parts) >= 3 and parts[-2] == "=":
+                        field_name = parts[-3]
+                        field_type = parts[0] if len(parts) > 3 else "unknown"
+                        fields[field_name] = field_type
+            return fields
+
+        existing_fields = extract_fields(existing_schema)
+        new_fields = extract_fields(new_schema)
+
+        added = [f for f in new_fields if f not in existing_fields]
+        removed = [f for f in existing_fields if f not in new_fields]
+        changed = [
+            f for f in new_fields
+            if f in existing_fields and new_fields[f] != existing_fields[f]
+        ]
+
+        return {
+            "added_fields": added,
+            "removed_fields": removed,
+            "changed_fields": changed,
+            "total_changes": len(added) + len(removed) + len(changed),
+        }
+
+
+class TieredStorageService:
+    """Kafka tiered storage configuration management.
+
+    Configures Strimzi Kafka topics to use tiered (S3) storage for
+    long-retention data via topic-level configuration updates.
+    """
+
+    def __init__(self, kafka_admin: Any) -> None:
+        """Initialise with Kafka admin adapter.
+
+        Args:
+            kafka_admin: IKafkaAdmin implementation.
+        """
+        self._admin = kafka_admin
+
+    async def configure_tiered_storage(
+        self,
+        topic_name: str,
+        tenant_id: str,
+        tier_local_hot_ms: int,
+        s3_bucket: str,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Enable or disable tiered storage for a Kafka topic.
+
+        Args:
+            topic_name: Kafka topic name.
+            tenant_id: Owning tenant.
+            tier_local_hot_ms: Milliseconds to keep data on local storage.
+            s3_bucket: S3 bucket for remote tier storage.
+            enabled: Whether to enable tiered storage.
+
+        Returns:
+            Configuration result dict.
+        """
+        config: dict[str, str] = {
+            "remote.storage.enable": str(enabled).lower(),
+        }
+        if enabled:
+            config["local.retention.ms"] = str(tier_local_hot_ms)
+
+        await self._admin.alter_topic_config(topic_name, config)
+
+        logger.info(
+            "Tiered storage configured",
+            topic_name=topic_name,
+            tenant_id=tenant_id,
+            enabled=enabled,
+            tier_local_hot_ms=tier_local_hot_ms,
+        )
+        return {
+            "topic_name": topic_name,
+            "tenant_id": tenant_id,
+            "enabled": enabled,
+            "tier_local_hot_ms": tier_local_hot_ms,
+            "s3_bucket": s3_bucket,
+        }

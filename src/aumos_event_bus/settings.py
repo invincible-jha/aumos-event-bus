@@ -67,4 +67,28 @@ class Settings(AumOSSettings):
     management_api_enabled: bool = True
     auto_create_standard_topics: bool = True
 
+    # -------------------------------------------------------------------------
+    # Stream processing (Gap #23)
+    # -------------------------------------------------------------------------
+    stream_backend: str = "ksqldb"
+    ksqldb_url: str = "http://ksqldb-server:8088"
+    ksqldb_username: str = ""
+    ksqldb_password: str = ""
+    flink_rest_url: str = "http://flink-jobmanager:8081"
+
+    # -------------------------------------------------------------------------
+    # Kafka Connect (Gap #24)
+    # -------------------------------------------------------------------------
+    kafka_connect_url: str = "http://kafka-connect:8083"
+
+    # -------------------------------------------------------------------------
+    # Strimzi / Geo-replication (Gap #27)
+    # -------------------------------------------------------------------------
+    strimzi_namespace: str = "kafka"
+
+    # -------------------------------------------------------------------------
+    # Tiered storage (Gap #28)
+    # -------------------------------------------------------------------------
+    tiered_storage_s3_bucket: str = "aumos-kafka-tiered-storage"
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_EVENTBUS_")
